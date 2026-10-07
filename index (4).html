@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract TitanYieldShield {
+    struct StakePosition {
+        uint256 stakedETH;
+        uint256 rewardDebt;
+        uint256 lockUntil;
+        bool isActive;
+    }
+
+    address payable public immutable shieldGovernor;
+    string public protocolDescriptor;
+    uint256 public rewardPoolBalance;
+    uint256 public totalStakedCapital;
+    uint256 public earlyExitFeeBps; // 200 = 2%
+    bool public isDepositingPaused;
+
+    mapping(address => StakePosition) public stakes;
+
+    event RewardPoolFunded(address indexed funder, uint256 amount);
+    event DescriptorUpdated(string newDescriptor);
+    event FeeConfigured(uint256 newFeeBps);
+    event YieldClaimed(address indexed user, uint256 rewardAmount);
+    event CapitalStaked(address indexed user, uint256 amount, uint256 lockUntil);
+    event DepositStateToggled(bool isPaused);
+    event CapitalWithdrawn(address indexed user, uint256 netPayout, uint256 feeRetained);
+
+    modifier onlyGovernor() {
+        require(msg.sender == shieldGovernor, "TitanShield: Unauthorized access");
+        _;
+    }
+
+    modifier whenOpen() {
+        require(!isDepositingPaused, "TitanShield: Deposits currently paused");
+        _;
+    }
+
+    constructor() {
+        shieldGovernor = payable(msg.sender);
+        protocolDescriptor = "Titan Base Shielded Yield Core v1";
+        earlyExitFeeBps = 200; // 2%
+        isDepositingPaused = false;
+    }
+
+    // 1. fundRewardPool (пополнение пула дивидендов)
+    function fundRewardPool() external payable onlyGovernor {
+        require(msg.value > 0, "TitanShield: Zero funding value");
+        rewardPoolBalance += msg.value;
+        emit RewardPoolFunded(msg.sender, msg.value);
+    }
+
+    // 2. modifyProtocolDescriptor (обновление мета-дескриптора)
+    function modifyProtocolDescriptor(string calldata newDescriptor) external onlyGovernor {
+        require(bytes(newDescriptor).length > 0, "TitanShield: Empty descriptor");
+        protocolDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // 3. setEarlyExitFee (настройка штрафа за ранний вывод)
+    function setEarlyExitFee(uint256 newFeeBps) external onlyGovernor {
+        require(newFeeBps <= 1000, "TitanShield: Max fee 10%");
+        earlyExitFeeBps = newFeeBps;
+        emit FeeConfigured(newFeeBps);
+    }
+
+    // 4. stakeCapital (внесение депозита в пул стейкинга)
+    function stakeCapital(uint256 lockDurationSeconds) external payable whenOpen {
+        require(msg.value > 0, "TitanShield: Stake must be positive");
+        StakePosition storage sp = stakes[msg.sender];
+
+        sp.stakedETH += msg.value;
+        sp.lockUntil = block.timestamp + lockDurationSeconds;
+        sp.isActive = true;
+        totalStakedCapital += msg.value;
+
+        emit CapitalStaked(msg.sender, msg.value, sp.lockUntil);
+    }
+
+    // 5. takeRewardPayout (клейм дивидендов из пула наград)
+    function takeRewardPayout(uint256 requestedReward) external {
+        StakePosition storage sp = stakes[msg.sender];
+        require(sp.isActive, "TitanShield: No active stake");
+        require(requestedReward <= rewardPoolBalance && requestedReward > 0, "TitanShield: Invalid reward amount");
+
+        rewardPoolBalance -= requestedReward;
+        sp.rewardDebt += requestedReward;
+
+        (bool sent, ) = payable(msg.sender).call{value: requestedReward}("");
+        require(sent, "TitanShield: Reward payout failed");
+
+        emit YieldClaimed(msg.sender, requestedReward);
+    }
+
+    // 6. toggleDepositState (переключение паузы депозитов)
+    function toggleDepositState(bool paused) external onlyGovernor {
+        isDepositingPaused = paused;
+        emit DepositStateToggled(paused);
+    }
+
+    // 7. withdrawStake (вывод стейка обратно на кошелек)
+    function withdrawStake(uint256 amount) external {
+        StakePosition storage sp = stakes[msg.sender];
+        require(sp.isActive && sp.stakedETH >= amount && amount > 0, "TitanShield: Insufficient stake");
+
+        uint256 fee = 0;
+        if (block.timestamp < sp.lockUntil) {
+            fee = (amount * earlyExitFeeBps) / 10000;
+        }
+
+        uint256 netPayout = amount - fee;
+        sp.stakedETH -= amount;
+        totalStakedCapital -= amount;
+        if (sp.stakedETH == 0) {
+            sp.isActive = false;
+        }
+
+        rewardPoolBalance += fee;
+
+        (bool sent, ) = payable(msg.sender).call{value: netPayout}("");
+        require(sent, "TitanShield: Stake payout failed");
+
+        emit CapitalWithdrawn(msg.sender, netPayout, fee);
+    }
+
+    // Чтение позиции стейкера
+    function getStakePosition(address account) external view returns (
+        uint256 stakedETH,
+        uint256 rewardDebt,
+        uint256 lockUntil,
+        bool isLocked,
+        bool isActive
+    ) {
+        StakePosition memory sp = stakes[account];
+        return (sp.stakedETH, sp.rewardDebt, sp.lockUntil, block.timestamp < sp.lockUntil, sp.isActive);
+    }
+}
